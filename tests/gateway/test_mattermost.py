@@ -393,6 +393,38 @@ class TestMattermostMentionBehavior:
             await self.adapter._handle_ws_event(self._make_event("hello", channel_id="chan_456"))
             assert self.adapter.handle_message.called
 
+    @pytest.mark.asyncio
+    async def test_thread_reply_bypasses_require_mention_if_root_mentioned_bot(self):
+        """Replies inside an existing thread bypass @mention only if root post mentioned the bot."""
+        event = self._make_event("hello reply in thread")
+        post_data = json.loads(event["data"]["post"])
+        post_data["root_id"] = "root_123"
+        event["data"]["post"] = json.dumps(post_data)
+
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_123", "message": "hey @hermes-bot help"})
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            await self.adapter._handle_ws_event(event)
+            assert self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_ignored_if_root_did_not_mention_bot(self):
+        """Replies inside a thread are ignored if root post did not mention the bot and reply has no mention."""
+        event = self._make_event("hello reply in thread")
+        post_data = json.loads(event["data"]["post"])
+        post_data["root_id"] = "root_123"
+        event["data"]["post"] = json.dumps(post_data)
+
+        self.adapter._api_get = AsyncMock(return_value={"id": "root_123", "message": "discussion between users"})
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            await self.adapter._handle_ws_event(event)
+            assert not self.adapter.handle_message.called
+
 
 # ---------------------------------------------------------------------------
 # File upload (send_image)
@@ -594,6 +626,162 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.message_id == "top_post_123"
 
 
+@pytest.mark.asyncio
+async def test_mattermost_top_level_dm_post_is_thread_root():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._dm_reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_post_123",
+        "user_id": "user_123",
+        "channel_id": "dm_chan_456",
+        "message": "hello hermes",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id == "dm_post_123"
+    assert msg_event.source.message_id == "dm_post_123"
+    assert msg_event.message_id == "dm_post_123"
+    assert msg_event.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+async def test_mattermost_dm_thread_reply_maintains_thread_root():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._dm_reply_mode = "thread"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_reply_456",
+        "user_id": "user_123",
+        "channel_id": "dm_chan_456",
+        "message": "follow up in dm thread",
+        "root_id": "dm_post_123",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id == "dm_post_123"
+    assert msg_event.source.message_id == "dm_reply_456"
+    assert msg_event.message_id == "dm_reply_456"
+    assert msg_event.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+async def test_mattermost_dm_reply_mode_off_stays_flat():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._dm_reply_mode = "off"
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "dm_post_flat_1",
+        "user_id": "user_123",
+        "channel_id": "dm_chan_456",
+        "message": "hello hermes flat",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "D",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id is None
+    assert msg_event.source.message_id == "dm_post_flat_1"
+    assert msg_event.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+async def test_mattermost_non_threaded_channel_stays_flat():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._non_threaded_channels = {"chan_flat_999"}
+    adapter._bot_user_id = "bot_user_id"
+    adapter._bot_username = "hermes-bot"
+    adapter.handle_message = AsyncMock()
+    post_data = {
+        "id": "chan_post_flat_1",
+        "user_id": "user_123",
+        "channel_id": "chan_flat_999",
+        "message": "@hermes-bot hello flat channel",
+        "root_id": "",
+    }
+    event = {
+        "event": "posted",
+        "data": {
+            "post": json.dumps(post_data),
+            "channel_type": "O",
+            "sender_name": "@alice",
+        },
+    }
+
+    await adapter._handle_ws_event(event)
+
+    msg_event = adapter.handle_message.call_args[0][0]
+    assert msg_event.source.thread_id is None
+    assert msg_event.source.message_id == "chan_post_flat_1"
+    assert msg_event.source.chat_type == "channel"
+
+
+@pytest.mark.asyncio
+async def test_mattermost_post_message_respects_dm_reply_mode_off():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._dm_reply_mode = "off"
+    adapter._api_post = AsyncMock(return_value={"id": "sent_123"})
+    
+    await adapter._post_message("dm_chan_456", "Hello from bot", reply_to="dm_post_1", metadata={"chat_type": "dm"})
+    
+    payload = adapter._api_post.call_args[0][1]
+    assert "root_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_mattermost_post_message_respects_non_threaded_channels():
+    adapter = _make_adapter()
+    adapter._reply_mode = "thread"
+    adapter._non_threaded_channels = {"chan_flat_999"}
+    adapter._api_post = AsyncMock(return_value={"id": "sent_123"})
+    
+    await adapter._post_message("chan_flat_999", "Hello from bot", reply_to="chan_post_1", metadata={"chat_type": "channel"})
+    
+    payload = adapter._api_post.call_args[0][1]
+    assert "root_id" not in payload
+
+
 # ---------------------------------------------------------------------------
 # Multiplex secondary-profile scope
 # ---------------------------------------------------------------------------
@@ -708,4 +896,131 @@ class TestMultiplexProfileScope:
             # skipped -- writing here would leak into every other profile's
             # os.environ.
             assert "MATTERMOST_REQUIRE_MENTION" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# Presence
+# ---------------------------------------------------------------------------
+
+class TestMattermostPresence:
+    """Presence status management: set_presence, _presence_loop, connect/disconnect lifecycle."""
+
+    def _make_adapter_with_mock_session(self):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(enabled=True, token="tok", extra={"url": "https://mm.example.com"})
+        adapter = MattermostAdapter(config)
+        adapter._bot_user_id = "bot123"
+        session = MagicMock()
+        session.closed = False
+        adapter._session = session
+        return adapter, session
+
+    @pytest.mark.asyncio
+    async def test_set_presence_online_puts_correct_payload(self):
+        """set_presence('online') sends PUT users/{id}/status with status='online'."""
+        adapter, _session = self._make_adapter_with_mock_session()
+        resp_data = {"user_id": "bot123", "status": "online"}
+        with patch.object(adapter, "_api_put", new=AsyncMock(return_value=resp_data)) as mock_put:
+            result = await adapter.set_presence("online")
+        mock_put.assert_called_once_with(
+            "users/bot123/status",
+            {"user_id": "bot123", "status": "online"},
+        )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_set_presence_offline_sends_offline(self):
+        """set_presence('offline') sends status='offline'."""
+        adapter, _session = self._make_adapter_with_mock_session()
+        resp_data = {"user_id": "bot123", "status": "offline"}
+        with patch.object(adapter, "_api_put", new=AsyncMock(return_value=resp_data)) as mock_put:
+            result = await adapter.set_presence("offline")
+        mock_put.assert_called_once_with(
+            "users/bot123/status",
+            {"user_id": "bot123", "status": "offline"},
+        )
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_set_presence_invalid_state_rejected(self):
+        """set_presence rejects unknown states and returns False without making an API call."""
+        adapter, _session = self._make_adapter_with_mock_session()
+        with patch.object(adapter, "_api_put", new=AsyncMock()) as mock_put:
+            result = await adapter.set_presence("invisible")
+        mock_put.assert_not_called()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_set_presence_no_user_id_is_noop(self):
+        """set_presence is a no-op when _bot_user_id is not yet resolved (pre-connect)."""
+        adapter, _session = self._make_adapter_with_mock_session()
+        adapter._bot_user_id = ""
+        with patch.object(adapter, "_api_put", new=AsyncMock()) as mock_put:
+            result = await adapter.set_presence("online")
+        mock_put.assert_not_called()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_connect_sets_presence_online_and_starts_presence_task(self):
+        """connect() sets presence to 'online' and starts the _presence_task."""
+        import asyncio
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(enabled=True, token="tok", extra={"url": "https://mm.example.com"})
+        adapter = MattermostAdapter(config)
+
+        me_resp = {"id": "botXYZ", "username": "hermes-bot"}
+        with (
+            patch.object(adapter, "_api_get", new=AsyncMock(return_value=me_resp)),
+            patch.object(adapter, "set_presence", new=AsyncMock(return_value=True)) as mock_presence,
+            patch("aiohttp.ClientSession") as mock_session_cls,
+            patch.object(adapter, "_ws_loop", new=AsyncMock()),
+            patch.object(adapter, "_wire_plugin_handlers"),
+            patch.object(adapter, "_mark_connected"),
+        ):
+            mock_session = MagicMock()
+            mock_session.closed = False
+            mock_session_cls.return_value = mock_session
+            result = await adapter.connect()
+
+        assert result is True
+        # set_presence("online") must have been called during connect
+        mock_presence.assert_any_call("online")
+        # _presence_task must have been created
+        assert adapter._presence_task is not None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_sets_presence_offline_and_cancels_presence_task(self):
+        """disconnect() cancels _presence_task and sets presence to 'offline' before closing the session."""
+        import asyncio
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+        config = PlatformConfig(enabled=True, token="tok", extra={"url": "https://mm.example.com"})
+        adapter = MattermostAdapter(config)
+        adapter._bot_user_id = "botXYZ"
+
+        # Set up a real (but immediately-done) presence task
+        async def _noop():
+            await asyncio.sleep(0)
+
+        adapter._presence_task = asyncio.create_task(_noop())
+
+        session = MagicMock()
+        session.closed = False
+        session.close = AsyncMock()
+        adapter._session = session
+
+        offline_calls = []
+        async def _set_presence(state="online"):
+            offline_calls.append(state)
+            return True
+
+        with (
+            patch.object(adapter, "set_presence", new=_set_presence),
+            patch.object(adapter, "_ws_task", None),
+            patch.object(adapter, "_reconnect_task", None),
+            patch.object(adapter, "_ws", None),
+        ):
+            await adapter.disconnect()
+
+        assert "offline" in offline_calls
+        session.close.assert_called_once()
 
