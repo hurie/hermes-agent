@@ -115,13 +115,22 @@ class MattermostAdapter(BasePlatformAdapter):
         self._ws: Any = None  # aiohttp.ClientWebSocketResponse
         self._ws_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._presence_task: Optional[asyncio.Task] = None
         self._closing = False
         # Reply mode: "thread" to nest replies, "off" for flat messages.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "") or _get_scoped_secret("MATTERMOST_REPLY_MODE", "off")).lower()
+        self._dm_reply_mode: str = (
+            config.extra.get("dm_reply_mode", "") or _get_scoped_secret("MATTERMOST_DM_REPLY_MODE", self._reply_mode)).lower()
+        self._non_threaded_channels = _channel_id_set(
+            _extra_or_secret(config.extra, "non_threaded_channels", "MATTERMOST_NON_THREADED_CHANNELS", blank_is_unset=False))
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
+        # Cache: root_post_id → bool (does root post mention the bot?)
+        # Keeps at most 512 entries; evicts oldest on overflow.
+        self._root_mention_cache: Dict[str, bool] = {}
+        self._root_mention_cache_order: list = []
 
     # --- HTTP helpers ---
 
@@ -169,6 +178,40 @@ class MattermostAdapter(BasePlatformAdapter):
     async def _api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._api("POST", path, payload)
 
+    async def _api_put(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._api("PUT", path, payload)
+
+    async def set_presence(self, state: str = "online") -> bool:
+        """Update Mattermost user presence status ('online', 'away', 'dnd', 'offline')."""
+        if not self._bot_user_id or not self._session or self._session.closed:
+            return False
+        valid_states = {"online", "away", "dnd", "offline"}
+        if state not in valid_states:
+            logger.warning("Mattermost: invalid presence state %r", state)
+            return False
+        try:
+            res = await self._api_put(
+                f"users/{self._bot_user_id}/status",
+                {"user_id": self._bot_user_id, "status": state},
+            )
+            logger.debug("Mattermost: presence set to %s", state)
+            return bool(res and res.get("status") == state)
+        except Exception as exc:
+            logger.debug("Mattermost: set_presence failed: %s", exc)
+            return False
+
+    async def _presence_loop(self) -> None:
+        """Periodically refresh online status (every 2 minutes) to prevent Mattermost idle timeout."""
+        while not self._closing:
+            try:
+                await asyncio.sleep(120)
+                if not self._closing:
+                    await self.set_presence("online")
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Mattermost: presence loop error: %s", exc)
+
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
         body = (self._last_post_error or "").lower()
@@ -176,6 +219,14 @@ class MattermostAdapter(BasePlatformAdapter):
             return False
         return (any(marker in body for marker in ("root_id", "rootid", "root id", "thread", "post"))
                 and any(marker in body for marker in ("invalid", "not found", "does not exist", "missing")))
+
+    def _should_thread(self, chat_id: str, is_dm: bool) -> bool:
+        """Evaluate whether a top-level interaction in chat_id/DM should initiate a thread."""
+        if is_dm:
+            return self._dm_reply_mode == "thread"
+        if chat_id in self._non_threaded_channels:
+            return False
+        return self._reply_mode == "thread"
 
     async def _post_preserving_thread(
         self, chat_id: str, payload: dict[str, Any], metadata: _Metadata) -> dict[str, Any]:
@@ -198,10 +249,12 @@ class MattermostAdapter(BasePlatformAdapter):
         if file_ids is not None:
             base["file_ids"] = file_ids
         payload = _with_mentions_disabled(base)
-        if self._reply_mode == "thread":
-            # root_id from reply_to, else metadata["thread_id"]/["root_id"], resolved to the true thread root.
-            candidate = reply_to or (
-                isinstance(metadata, dict) and (metadata.get("thread_id") or metadata.get("root_id")))
+        # Determine root_id: explicit thread in metadata/reply_to, or top-level threaded interaction via _should_thread.
+        explicit_thread = isinstance(metadata, dict) and (metadata.get("thread_id") or metadata.get("root_id"))
+        chat_type = metadata.get("chat_type") if isinstance(metadata, dict) else ""
+        is_dm = chat_type == "dm"
+        if explicit_thread or self._should_thread(chat_id, is_dm):
+            candidate = reply_to or explicit_thread
             if candidate:
                 payload["root_id"] = await self._resolve_root_id(str(candidate))
         return await self._post_preserving_thread(chat_id, payload, metadata)
@@ -247,11 +300,15 @@ class MattermostAdapter(BasePlatformAdapter):
             "Mattermost: authenticated as @%s (%s) on %s", self._bot_username, self._bot_user_id, self._base_url)
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._mark_connected()
+        await self.set_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
         self._wire_plugin_handlers(None)  # plugin-registered native handlers
         return True
 
     async def disconnect(self) -> None:
         self._closing = True
+        await cancel_task(self._presence_task)
+        self._presence_task = None
         await cancel_task(self._ws_task)
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
@@ -259,6 +316,10 @@ class MattermostAdapter(BasePlatformAdapter):
             await self._ws.close()
             self._ws = None
         if self._session and not self._session.closed:
+            try:
+                await self.set_presence("offline")
+            except Exception:
+                pass
             await self._session.close()
         logger.info("Mattermost: disconnected")
 
@@ -268,6 +329,30 @@ class MattermostAdapter(BasePlatformAdapter):
             return post_id
         data = await self._api_get(f"posts/{post_id}")
         return data["root_id"] if data and data.get("root_id") else post_id
+
+    async def _root_post_has_mention(self, root_id: str) -> bool:
+        """Return True if the root post of a thread mentions this bot.
+
+        Result is cached (up to 512 entries) so we don't re-fetch on every
+        reply in the same thread.
+        """
+        if root_id in self._root_mention_cache:
+            return self._root_mention_cache[root_id]
+        try:
+            data = await self._api_get(f"posts/{root_id}")
+            text = (data.get("message") or "").lower()
+        except Exception:
+            # On fetch failure, fall back to safe default: no mention → block.
+            text = ""
+        mention_patterns = [f"@{self._bot_username}".lower(), f"@{self._bot_user_id}".lower()]
+        result = any(p in text for p in mention_patterns)
+        # Evict oldest entry if cache at capacity.
+        if len(self._root_mention_cache) >= 512:
+            oldest = self._root_mention_cache_order.pop(0)
+            self._root_mention_cache.pop(oldest, None)
+        self._root_mention_cache[root_id] = result
+        self._root_mention_cache_order.append(root_id)
+        return result
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -492,10 +577,10 @@ class MattermostAdapter(BasePlatformAdapter):
                 logger.info("Mattermost: WebSocket closed (%s)", kind)
                 break
 
-    def _apply_channel_gating(self, channel_id: str, message_text: str) -> Optional[str]:
+    def _apply_channel_gating(self, channel_id: str, message_text: str, in_thread: bool = False) -> Optional[str]:
         """Mention-gate a non-DM post; return the cleaned text, or None to ignore it. allowed_channels is a
         whitelist checked first (@mentions elsewhere are ignored); require_mention (default true) is
-        bypassed in free_response_channels."""
+        bypassed in free_response_channels and for replies inside an existing thread (in_thread=True)."""
         allowed_channels = _channel_id_set(_extra_or_secret(self.config.extra, "allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", blank_is_unset=False))
         if allowed_channels and channel_id not in allowed_channels:
             logger.debug("Mattermost: ignoring message in non-allowed channel: %s", channel_id)
@@ -506,7 +591,7 @@ class MattermostAdapter(BasePlatformAdapter):
             _extra_or_secret(self.config.extra, "free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", blank_is_unset=False))
         mention_patterns = [f"@{self._bot_username}", f"@{self._bot_user_id}"]
         has_mention = any(pattern.lower() in message_text.lower() for pattern in mention_patterns)
-        if require_mention and channel_id not in free_channels and not has_mention:
+        if require_mention and channel_id not in free_channels and not has_mention and not in_thread:
             logger.debug("Mattermost: skipping non-DM message without @mention (channel=%s)", channel_id)
             return None
         if has_mention:  # strip the @mention so the agent sees clean input
@@ -562,12 +647,19 @@ class MattermostAdapter(BasePlatformAdapter):
         channel_id, is_dm = post.get("channel_id", ""), data.get("channel_type", "O") == "D"
         message_text = post.get("message", "")
         if not is_dm:  # DMs need no gating; channels are mention-gated.
-            message_text = self._apply_channel_gating(channel_id, message_text)
+            # For replies inside an existing thread, only bypass the mention
+            # requirement when the *root* post itself mentioned the bot — this
+            # prevents Hermes from joining threads that never addressed it.
+            root_id = post.get("root_id") or None
+            in_thread_with_mention = False
+            if root_id:
+                in_thread_with_mention = await self._root_post_has_mention(root_id)
+            message_text = self._apply_channel_gating(channel_id, message_text, in_thread=in_thread_with_mention)
             if message_text is None:
                 return
-        # Thread support: replies use root_id; in thread mode a top-level channel post is itself a valid root.
+        # Thread support: replies use root_id; in thread mode a top-level post is itself a valid root.
         thread_id = post.get("root_id") or None
-        if not thread_id and self._reply_mode == "thread" and not is_dm and post_id:
+        if not thread_id and self._should_thread(channel_id, is_dm) and post_id:
             thread_id = post_id
         if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
             message_text = message_text.lstrip()
@@ -701,13 +793,20 @@ def interactive_setup() -> None:
 _YAML_BRIDGE = (  # (yaml key, env var, kind) for apply_yaml_bridge; allowed_channels is a whitelist
     ("require_mention", "MATTERMOST_REQUIRE_MENTION", "lower"),
     ("free_response_channels", "MATTERMOST_FREE_RESPONSE_CHANNELS", "csv"),
-    ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", "csv"))
+    ("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", "csv"),
+    ("reply_mode", "MATTERMOST_REPLY_MODE", "lower"),
+    ("dm_reply_mode", "MATTERMOST_DM_REPLY_MODE", "lower"),
+    ("non_threaded_channels", "MATTERMOST_NON_THREADED_CHANNELS", "csv"))
 
 
 def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     """``apply_yaml_config_fn`` (#24836 / #25443): ``config.yaml`` ``mattermost:`` keys → env vars (env wins;
     skipped under a multiplexed secondary profile) + ``PlatformConfig.extra`` (extra-first readers)."""
-    return _apply_yaml_bridge(mattermost_cfg, _YAML_BRIDGE)
+    # Promote nested extra keys if provided under mattermost.extra
+    merged = dict(mattermost_cfg)
+    if isinstance(mattermost_cfg.get("extra"), dict):
+        merged.update(mattermost_cfg["extra"])
+    return _apply_yaml_bridge(merged, _YAML_BRIDGE)
 
 
 
