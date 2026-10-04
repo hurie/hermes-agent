@@ -228,6 +228,10 @@ class MattermostAdapter(BasePlatformAdapter):
             return False
         return self._reply_mode == "thread"
 
+    def should_thread_progress(self, chat_id: str, is_dm: bool = False) -> bool:
+        """Return True if progress/streaming in chat_id should be threaded."""
+        return self._should_thread(chat_id, is_dm)
+
     async def _post_preserving_thread(
         self, chat_id: str, payload: dict[str, Any], metadata: _Metadata) -> dict[str, Any]:
         """Post once, optionally falling back flat for final notify content."""

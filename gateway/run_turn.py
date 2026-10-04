@@ -3142,11 +3142,13 @@ class GatewayTurnMixin:
         from gateway.run import _non_conversational_metadata, _resolve_progress_thread_id
         is_buzz = str(getattr(source.platform, "value", source.platform) or "").lower() == "buzz"
         _progress_reply_in_thread = True
-        _adapter = self._delivery_adapter_for(source) if source.platform == Platform.SLACK or is_buzz else None
+        _adapter = self._delivery_adapter_for(source) if source.platform in (Platform.SLACK, Platform.MATTERMOST) or is_buzz else None
         if _adapter is not None:
             try:
                 if is_buzz:
                     _progress_reply_in_thread = getattr(_adapter, "_reply_to_mode", "first") != "off"
+                elif source.platform == Platform.MATTERMOST and hasattr(_adapter, "should_thread_progress"):
+                    _progress_reply_in_thread = _adapter.should_thread_progress(source.chat_id, source.chat_type == "dm")
                 else:
                     # Relay lane: the adapter owns mode resolution; native lane: flat extra key.
                     _mode_fn = getattr(_adapter, "_effective_reply_in_thread", None)
